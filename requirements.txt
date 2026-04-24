@@ -1,0 +1,9 @@
+pandas
+numpy
+scikit-learn
+matplotlib
+seaborn
+pyyaml
+xlrd>=2.0.1
+openpyxl
+joblib
