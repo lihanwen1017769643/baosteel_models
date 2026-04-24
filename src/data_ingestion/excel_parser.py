@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import re
 from pathlib import Path
 from typing import Dict, List, Tuple
@@ -8,6 +9,7 @@ import numpy as np
 import pandas as pd
 
 from src.data_ingestion.metadata import extract_metadata_from_path, parse_title_metadata
+from src.utils.io_utils import ensure_dir
 
 
 POLLUTANTS = ["烟尘", "二氧化硫", "氮氧化物"]
@@ -126,7 +128,19 @@ def parse_single_excel(file_path: Path) -> pd.DataFrame:
     return data.reset_index(drop=True)
 
 
-def parse_all_excels(data_root: Path, file_glob: str = "**/*.xls", max_files: int | None = None) -> pd.DataFrame:
+def _cache_name_for_file(file_path: Path) -> str:
+    digest = hashlib.md5(str(file_path).encode("utf-8")).hexdigest()  # noqa: S324
+    return f"{digest}.pkl"
+
+
+def parse_all_excels(
+    data_root: Path,
+    file_glob: str = "**/*.xls",
+    max_files: int | None = None,
+    batch_size: int = 20,
+    cache_dir: Path | None = None,
+    resume_parse: bool = False,
+) -> pd.DataFrame:
     files = sorted([p for p in data_root.glob(file_glob) if p.is_file()])
     if max_files is not None:
         if len(files) > max_files:
@@ -147,20 +161,41 @@ def parse_all_excels(data_root: Path, file_glob: str = "**/*.xls", max_files: in
                 if not advanced:
                     break
             files = sorted(selected)
+
+    cache_root = None
+    if cache_dir is not None:
+        cache_root = ensure_dir(cache_dir)
+
     frames = []
     errors: Dict[str, str] = {}
     for i, p in enumerate(files, 1):
         try:
-            frames.append(parse_single_excel(p))
+            loaded_from_cache = False
+            cache_file = None
+            if cache_root is not None:
+                cache_file = cache_root / _cache_name_for_file(p)
+                if resume_parse and cache_file.exists():
+                    frames.append(pd.read_pickle(cache_file))
+                    loaded_from_cache = True
+
+            if not loaded_from_cache:
+                parsed = parse_single_excel(p)
+                frames.append(parsed)
+                if cache_file is not None:
+                    parsed.to_pickle(cache_file)
         except Exception as e:  # noqa: BLE001
             errors[str(p)] = str(e)
-        if i % 20 == 0:
+        if i % max(batch_size, 1) == 0:
             print(f"[parse] processed {i}/{len(files)} files")
 
     all_df = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
     if errors:
         err_df = pd.DataFrame({"file": list(errors.keys()), "error": list(errors.values())})
         err_df.to_csv("outputs/tables/parse_errors.csv", index=False, encoding="utf-8-sig")
+    else:
+        err_path = Path("outputs/tables/parse_errors.csv")
+        if err_path.exists():
+            err_path.unlink()
     return all_df
 
 

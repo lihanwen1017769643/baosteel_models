@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-import json
+import argparse
 import sys
 from pathlib import Path
 
@@ -31,9 +31,20 @@ from src.utils.logging_utils import setup_logger
 from src.visualization.eda import save_basic_eda_tables, save_eda_figures
 
 
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Industrial time-series anomaly pipeline")
+    parser.add_argument("--config", default="configs/default.yaml", help="Path to config yaml")
+    parser.add_argument("--max-files", type=int, default=None, help="Override max parsed source files")
+    parser.add_argument("--full-data", action="store_true", help="Parse all files under data root")
+    parser.add_argument("--batch-size", type=int, default=None, help="Parser progress batch size")
+    parser.add_argument("--resume-parse", action="store_true", help="Reuse parser cache when available")
+    return parser.parse_args()
+
+
 def main() -> None:
+    args = parse_args()
     logger = setup_logger()
-    cfg = load_config(ROOT / "configs/default.yaml")
+    cfg = load_config(ROOT / args.config)
 
     data_root = ROOT / cfg["data"]["data_root"]
     mapping_file = ROOT / cfg["data"]["mapping_file"]
@@ -43,10 +54,20 @@ def main() -> None:
     ensure_dir(ROOT / "outputs/models")
 
     logger.info("1) 解析 Excel")
+    max_files = cfg["data"].get("max_files")
+    if args.max_files is not None:
+        max_files = args.max_files
+    if args.full_data:
+        max_files = None
+    batch_size = int(args.batch_size or cfg["data"].get("parse_batch_size", 20))
+
     raw_df = parse_all_excels(
         data_root,
         cfg["data"]["file_glob"],
-        max_files=cfg["data"].get("max_files"),
+        max_files=max_files,
+        batch_size=batch_size,
+        cache_dir=ROOT / cfg["data"].get("parse_cache_dir", "outputs/cache/parsed"),
+        resume_parse=args.resume_parse,
     )
     if raw_df.empty:
         raise RuntimeError("没有解析到可用数据")
@@ -233,6 +254,13 @@ def main() -> None:
 
     # 训练日志
     run_log = {
+        "run_args": {
+            "config": args.config,
+            "max_files": max_files,
+            "full_data": args.full_data,
+            "batch_size": batch_size,
+            "resume_parse": args.resume_parse,
+        },
         "overview": overview,
         "clean_stats": clean_stats,
         "label_summary": label_summary,

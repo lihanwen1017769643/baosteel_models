@@ -6,6 +6,8 @@ data:
   mapping_file: data/数据报表_20260405/点位及治理工艺.xlsx
   file_glob: "**/*.xls"
   max_files: 8
+  parse_batch_size: 20
+  parse_cache_dir: outputs/cache/parsed
 
 cleaning:
   drop_all_nan_col: true
