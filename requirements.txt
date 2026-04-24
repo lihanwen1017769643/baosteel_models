@@ -7,3 +7,4 @@ pyyaml
 xlrd>=2.0.1
 openpyxl
 joblib
+lightgbm

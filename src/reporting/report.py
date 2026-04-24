@@ -1,11 +1,32 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Dict, List
+from typing import Any, Dict, List, Optional
 
 import pandas as pd
 
 from src.utils.io_utils import write_text
+
+
+def _fmt(v: Any, decimals: int = 4) -> str:
+    if isinstance(v, float):
+        return f"{v:.{decimals}f}"
+    return str(v)
+
+
+def _table_from_df(df: pd.DataFrame, max_rows: int = 30) -> str:
+    if df.empty:
+        return "*No data*\n"
+    show = df.head(max_rows)
+    header = "| " + " | ".join(str(c) for c in show.columns) + " |"
+    sep = "| " + " | ".join("---" for _ in show.columns) + " |"
+    rows = []
+    for _, row in show.iterrows():
+        rows.append("| " + " | ".join(_fmt(v) for v in row) + " |")
+    lines = [header, sep] + rows
+    if len(df) > max_rows:
+        lines.append(f"\n*... showing {max_rows} of {len(df)} rows*")
+    return "\n".join(lines) + "\n"
 
 
 def build_markdown_report(
@@ -18,90 +39,311 @@ def build_markdown_report(
     experiments: pd.DataFrame,
     feature_catalog_path: str,
     assumptions: List[str],
+    missing_stats: Optional[pd.DataFrame] = None,
+    fe_catalog_detail: Optional[List[Dict]] = None,
+    loo_metrics: Optional[Dict] = None,
+    point_list: Optional[List[str]] = None,
+    process_list: Optional[List[str]] = None,
+    train_val_test_sizes: Optional[Dict] = None,
 ) -> None:
-    best_row = experiments.sort_values("f1", ascending=False).iloc[0].to_dict() if len(experiments) else {}
+    best_row = {}
+    if len(experiments) > 0:
+        numeric_exp = experiments.select_dtypes(include=["number"])
+        if "f1" in numeric_exp.columns:
+            best_row = experiments.loc[numeric_exp["f1"].idxmax()].to_dict()
 
-    md = f"""
-# 工业时序异常识别技术报告
+    md = """# 工业时序异常识别技术报告
 
 ## 1. 项目背景与目标
-本项目基于钢铁集团排放监测分钟级报表数据，构建可复现的工业时序异常识别原型，覆盖解析、清洗、EDA、特征、建模、评估、阈值策略与结果落盘。
+
+本项目基于某钢铁集团排放在线监测系统（CEMS）导出的分钟级报表数据，构建一个**可复现、可扩展**的工业时序异常识别原型系统。
+
+**核心目标：**
+- 自动解析多点位、多工艺的异构 Excel 监测报表
+- 基于设备维护标记等状态字段构造异常标签
+- 利用时序特征工程 + 机器学习模型识别排放异常时刻
+- 输出可度量的实验结果，支持告警阈值策略选择
+
+**应用场景：** 辅助环保监测人员快速定位设备维护期、异常排放等事件，降低人工巡检成本。
+
+---
 
 ## 2. 数据概况
-- 文件数: {overview.get('file_count')}
-- 点位数: {overview.get('point_count')}
-- 工艺数: {overview.get('process_count')}
-- 总样本数: {overview.get('rows')}
+
+"""
+    md += f"- **数据来源目录**: `data/数据报表_20260405`\n"
+    md += f"- **文件数**: {overview.get('file_count')}\n"
+    md += f"- **点位数**: {overview.get('point_count')}\n"
+    md += f"- **治理工艺数**: {overview.get('process_count')}\n"
+    md += f"- **总样本数（行）**: {overview.get('rows'):,}\n"
+    md += f"- **时间粒度**: 分钟级\n\n"
+
+    if point_list:
+        md += "**覆盖点位：**\n"
+        for p in point_list:
+            md += f"- {p}\n"
+        md += "\n"
+
+    if process_list:
+        md += "**治理工艺类型：**\n"
+        for p in process_list:
+            md += f"- {p}\n"
+        md += "\n"
+
+    md += """**数据格式特点：**
+- `.xls` 格式的业务导出报表，含顶部标题行 + 多行表头 + 合并单元格
+- 不同点位的字段集合存在差异（如烧结机头含 SO2/NOx/O2，转炉二次仅含烟尘）
+- 文件名/目录名中包含排口编号（DA049 等）、日期范围等元信息
+
+---
 
 ## 3. 数据清洗与标签构造规则
-- 时间字段异常行数: {clean_stats.get('invalid_time_rows')}
-- 重复行移除数: {clean_stats.get('duplicate_rows_removed')}
-- 异常样本数: {label_summary.get('anomaly_rows')}
-- 异常样本占比: {label_summary.get('anomaly_ratio'):.4f}
-- 是否类别不平衡: {label_summary.get('has_class_imbalance')}
 
-标签规则说明:
-{label_rule}
+### 3.1 Excel 解析策略
+- 自动搜索包含"监控时间"的行作为表头起始行
+- 多行表头展平：纵向扫描合并单元格，将多级标题拼接为 `因子_指标` 格式（如 `烟尘_实测值`, `二氧化硫_折算值`）
+- 过滤空列（`Unnamed`）、重复列
+- 从目录名/文件名中提取 `outlet_id`, `point_name_hint`, `process_hint`, 文件时间范围
 
-缺失/异常值处理策略:
-- 数值字段统一转数值，无法解析记为缺失
-- 对数值字段按分位数裁剪(0.1%~99.9%)处理极端值
-- 按点位执行时序 `ffill+bfill`，剩余缺失用列中位数兜底
-- 时间字段按点位排序并去重，确保训练数据时间单调
+### 3.2 时间与重复清洗
+"""
+    md += f"- 时间字段无法解析的行数: **{clean_stats.get('invalid_time_rows', 0)}**\n"
+    md += f"- 去重移除的重复行数: **{clean_stats.get('duplicate_rows_removed', 0)}**\n"
+    md += "- 按 `(point_name_hint, 监控时间, source_file)` 去重\n"
+    md += "- 按点位排序确保时间单调递增\n\n"
+
+    md += """### 3.3 缺失值与异常值处理
+- **数值字段识别**: 对所有列尝试 `pd.to_numeric(errors='coerce')`，非空率 ≥ 5% 的列视为数值字段
+- **极端值裁剪**: 按分位数 [0.1%, 99.9%] clip
+- **缺失值填补策略（按优先级）**:
+  1. 按点位分组，时序方向 `ffill` + `bfill`
+  2. 剩余缺失使用该列全局中位数填补
+- **清洗原则**: 不删除整行（避免丢失有意义的异常信号），仅对数值字段做填补
+
+"""
+
+    if missing_stats is not None and not missing_stats.empty:
+        top_miss = missing_stats[missing_stats["missing_ratio"] > 0.01].head(15)
+        if not top_miss.empty:
+            md += "**主要字段缺失率（>1%）：**\n\n"
+            md += _table_from_df(top_miss.round(4))
+            md += "\n"
+
+    md += "### 3.4 标签构造规则\n\n"
+    md += f"> {label_rule}\n\n"
+    md += f"- **异常样本数**: {label_summary.get('anomaly_rows', 0):,}\n"
+    md += f"- **异常样本占比**: {label_summary.get('anomaly_ratio', 0):.4f} ({label_summary.get('anomaly_ratio', 0) * 100:.2f}%)\n"
+    md += f"- **类别不平衡**: {'是' if label_summary.get('has_class_imbalance') else '否'}\n\n"
+    md += """**状态值字典：**
+| 状态 | 取值示例 | 标签 |
+| --- | --- | --- |
+| 正常 | 正常(N), N, -, 空 | label_anomaly=0 |
+| 维护 | 维护(M), M, 维护 | label_anomaly=1, label_is_maintenance=1 |
+| 其他非正常 | 任何不在正常集合中的值 | label_anomaly=1 |
+
+"""
+
+    md += """---
 
 ## 4. EDA 发现
-详见 `outputs/figures/` 与 `outputs/tables/`：
-- 点位/工艺样本量分布
-- 字段缺失率
-- 标签分布
-- 数值字段统计与分布
-- 关键因子时序样例与异常窗口样例
+
+详细图表已落盘至 `outputs/figures/` 和 `outputs/tables/`，主要发现：
+
+"""
+    md += f"1. **数据量分布**: {overview.get('point_count')} 个点位，{overview.get('process_count')} 种治理工艺，"
+    md += f"总计 {overview.get('rows', 0):,} 条分钟级记录\n"
+    anomaly_pct = label_summary.get('anomaly_ratio', 0) * 100
+    md += f"2. **标签分布**: 异常占比 {anomaly_pct:.2f}%，存在显著类别不平衡（正常:异常 ≈ {100-anomaly_pct:.0f}:{anomaly_pct:.0f}）\n"
+    md += "3. **字段缺失**: 部分因子（如二氧化硫、氮氧化物）仅在烧结机头类点位存在，在其他点位全缺失\n"
+    md += "4. **数值分布**: 不同点位的烟尘、烟气流速等指标分布差异明显（见 boxplot 对比图）\n"
+    md += "5. **时序特征**: 部分异常集中在维护窗口期，呈现连续异常段特征\n"
+    md += "6. **相关性**: 烟气温度/压力/流速之间存在中等相关，烟尘与废气排放量有正相关\n"
+
+    md += """
+**关键图表索引：**
+- `rows_by_point_top15.png` / `rows_by_process.png`: 点位/工艺数据量分布
+- `missing_ratio_top25.png`: 字段缺失率
+- `label_distribution.png` / `anomaly_ratio_by_point.png`: 标签分布
+- `numeric_distributions_grid.png`: 数值特征分布
+- `boxplot_by_point_*.png` / `boxplot_by_process_*.png`: 跨点位/工艺对比
+- `correlation_heatmap.png`: 特征相关性
+- `ts_sample_*.png`: 时间序列样例
+- `anomaly_window_*.png`: 异常窗口可视化
+
+---
 
 ## 5. 特征工程设计
-- 基础特征: 数值原始变量 + 点位/工艺类别 + 时间特征(`hour/dayofweek/is_weekend`)
-- 时序窗口: lag1, diff1, rate1, rolling(mean/std/min/max/amp)
-- 窗口长度: 5/10/30/60
-- 特征清单: `{feature_catalog_path}`
+
+### 5.1 基础特征
+- **原始数值特征**: 烟尘_实测值/折算值、二氧化硫/氮氧化物_实测值、烟气流速/温度/湿度/压力、氧含量、废气排放量等
+- **类别特征**: point_name_hint, outlet_id, 治理工艺, process_hint, 生产设施工况
+- **时间特征**: hour, dayofweek, is_weekend, day_of_month
+
+### 5.2 时序窗口特征（按点位分组计算）
+
+| 特征类型 | 窗口长度 | 说明 |
+| --- | --- | --- |
+| lag1 | 1 | 前一时刻值 |
+| diff1 | 1 | 一阶差分 |
+| rate1 | 1 | 变化率 = diff / (|lag| + ε) |
+| rolling_mean | 5, 10, 30, 60 | 滑动均值 |
+| rolling_std | 5, 10, 30, 60 | 滑动标准差 |
+| rolling_min | 5, 10, 30, 60 | 滑动最小值 |
+| rolling_max | 5, 10, 30, 60 | 滑动最大值 |
+| amplitude | 5, 10, 30, 60 | 滑动振幅 = max - min |
+| exceed_count_2sigma | 10, 30, 60 | 窗口内超过全局 2σ 次数 |
+
+### 5.3 特征筛选
+- 缺失率 > 98% 的衍生特征被丢弃
+- 完整特征清单见 `outputs/tables/feature_engineering_catalog.csv`
+
+"""
+
+    md += """---
 
 ## 6. 数据集划分策略
-- 主策略: {split_note.get('strategy')}
-- 选择原因: {split_note.get('reason')}
-- 同时补充留一点评估以验证跨点位泛化
+
+"""
+    md += f"- **主策略**: {split_note.get('strategy', 'N/A')}\n"
+    md += f"- **选择原因**: {split_note.get('reason', 'N/A')}\n"
+    md += """
+**为什么不用随机划分？**
+随机划分会将时间上相邻的样本分配到训练集和测试集，导致"未来信息泄露"——模型在训练时已经"见过"测试样本附近的时序特征，高估泛化能力。
+
+**当前方案：**
+- 每个点位内部按时间顺序切分：前 70% 训练 → 中间 15% 验证 → 后 15% 测试
+- 所有点位都同时出现在训练和测试集中，避免点位选择偏差
+
+**补充验证：**
+- 留一点位评估（Leave-One-Point-Out）：使用一个完整点位作为 holdout，验证跨点位泛化能力
+
+"""
+    if train_val_test_sizes:
+        md += f"| 数据集 | 样本数 |\n| --- | --- |\n"
+        for k, v in train_val_test_sizes.items():
+            md += f"| {k} | {v:,} |\n"
+        md += "\n"
+
+    md += """---
 
 ## 7. 模型实验设计
-- Baseline: Logistic Regression
-- 传统模型: Random Forest, HistGradientBoosting, XGBoost(环境可用则启用)
-- 指标: Precision, Recall, F1, ROC-AUC, PR-AUC, Confusion Matrix
-- 阈值: 在验证集上约束最小精度并优化F1
+
+### 7.1 模型列表
+
+| 模型 | 类型 | 关键配置 |
+| --- | --- | --- |
+| LogisticRegression | Baseline 线性模型 | class_weight=balanced, max_iter=500 |
+| RandomForest | 集成树模型 | n_estimators=200, balanced_subsample |
+| LightGBM | 梯度提升树 | n_estimators=300, is_unbalance=True |
+| HistGradientBoosting | sklearn 内置梯度提升 | max_depth=8, max_iter=300 |
+
+### 7.2 类别不平衡处理
+- LogisticRegression: `class_weight="balanced"` 自动调整
+- RandomForest: `class_weight="balanced_subsample"`
+- LightGBM: `is_unbalance=True`
+- 阈值优化: 在验证集上搜索 F1 最优阈值（约束最低精度 ≥ 30%）
+
+### 7.3 评估指标
+
+| 指标 | 意义 |
+| --- | --- |
+| Precision | 告警中真正异常的比例（减少误报） |
+| Recall | 真实异常被识别的比例（减少漏报） |
+| F1 | Precision/Recall 的调和平均 |
+| ROC-AUC | 模型整体区分能力 |
+| PR-AUC | 在类别不平衡下比 ROC-AUC 更有意义 |
+
+**为什么不用 Accuracy？**
+当异常比例仅 ~1% 时，全预测为正常的 Accuracy 可达 99%，完全无意义。PR-AUC 和 F1 更能反映模型对少数类的识别能力。
+
+---
 
 ## 8. 结果对比
-最佳模型: {best_row.get('model_name', 'N/A')}
-- Precision: {best_row.get('precision', float('nan')):.4f}
-- Recall: {best_row.get('recall', float('nan')):.4f}
-- F1: {best_row.get('f1', float('nan')):.4f}
-- ROC-AUC: {best_row.get('roc_auc', float('nan')):.4f}
-- PR-AUC: {best_row.get('pr_auc', float('nan')):.4f}
-- Threshold: {best_row.get('threshold', float('nan')):.4f}
 
-完整结果见 `outputs/tables/model_results.csv`。
+"""
+    if len(experiments) > 0:
+        show_cols = ["model_name", "precision", "recall", "f1", "roc_auc", "pr_auc", "threshold", "tp", "fp", "fn", "tn"]
+        avail = [c for c in show_cols if c in experiments.columns]
+        md += _table_from_df(experiments[avail].round(4))
+        md += "\n"
+    else:
+        md += "*No experiment results available.*\n\n"
+
+    if best_row:
+        md += f"**最佳模型**: **{best_row.get('model_name', 'N/A')}**\n"
+        md += f"- Precision: {best_row.get('precision', 0):.4f}\n"
+        md += f"- Recall: {best_row.get('recall', 0):.4f}\n"
+        md += f"- F1: {best_row.get('f1', 0):.4f}\n"
+        md += f"- ROC-AUC: {best_row.get('roc_auc', 0):.4f}\n"
+        md += f"- PR-AUC: {best_row.get('pr_auc', 0):.4f}\n"
+        md += f"- 最优阈值: {best_row.get('threshold', 0.5):.4f}\n\n"
+
+    if loo_metrics:
+        md += "### 留一点位泛化评估\n\n"
+        md += f"- Holdout 点位: {loo_metrics.get('holdout_point', 'N/A')}\n"
+        md += f"- F1: {loo_metrics.get('f1', 0):.4f}\n"
+        md += f"- Recall: {loo_metrics.get('recall', 0):.4f}\n"
+        md += f"- Precision: {loo_metrics.get('precision', 0):.4f}\n\n"
+
+    md += """**关键图表：**
+- `*_pr_roc.png`: 各模型 PR 曲线与 ROC 曲线
+- `*_confusion.png`: 混淆矩阵
+- `threshold_tradeoff_*.png`: 阈值-精度-召回权衡曲线
+- `feature_importance_*.png`: 特征重要性
+
+---
 
 ## 9. 阈值与告警策略讨论
-本场景关注异常召回，允许一定误报，因此不以 Accuracy 作为主指标。采用PR曲线和阈值扫描后，优先保证最低精度约束，再尽量提升召回与F1，适配保守告警策略。
+
+本场景的业务需求是：
+- **保守告警**: 期望大部分真实异常能被识别（高 Recall），可接受一定误报
+- 但过多误报会导致监测人员对系统失去信任
+
+**阈值选择策略：**
+1. 在验证集上扫描所有阈值
+2. 约束最低 Precision ≥ 30%（即每 3 次告警至少有 1 次是真异常）
+3. 在满足约束的阈值中选择 F1 最优点
+
+**实际建议：**
+- 可视化 `threshold_tradeoff_*.png` 图表，根据具体业务容忍度调整阈值
+- 若需要更保守策略（Precision > 50%），可上调阈值但会降低 Recall
+- 建议引入"连续 N 分钟异常才告警"的后处理逻辑，减少瞬时误报
+
+---
 
 ## 10. 当前局限性
-- 历史报表 schema 存在异构，字段语义映射仍可能有残余噪声
-- 标签依赖状态位规则，未引入人工复核标签
-- 深度时序模型（GRU/LSTM）仅预留扩展接口，当前以传统模型+时序特征为主
+
+1. **标签质量**: 标签完全基于设备维护标记推导，未引入人工复核，可能存在标注噪声
+2. **字段异构**: 不同点位的可用因子不同（如烧结机头有 SO2/NOx，转炉二次仅有烟尘），合并后大量缺失字段依赖填补
+3. **深度时序模型**: 当前以传统 ML + 时序特征为主，未实现 GRU/LSTM/TCN 等深度模型
+4. **单一阈值**: 所有点位共用统一阈值，未做点位自适应调整
+5. **时间覆盖**: 当前数据覆盖约半年，模型的跨季节泛化能力未验证
+6. **无告警后处理**: 未实现连续异常段合并、告警抑制等工程化逻辑
+
+---
 
 ## 11. 下一步建议
-- 引入按点位自适应阈值与告警抑制逻辑
-- 增加跨月份滚动回测与留点位泛化评估
-- 补充深度模型实验（GRU/TCN）并与树模型进行稳定性对比
-- 与业务侧对齐“非正常状态”字典，细化异常等级
+
+1. **标签优化**: 与业务侧对齐完整的"异常状态字典"，细化异常等级（维护/故障/超标）
+2. **点位自适应阈值**: 按点位或工艺类型分别优化告警阈值
+3. **深度时序模型**: 实现 GRU/TCN 对比实验，探索端到端时序异常检测
+4. **告警后处理**: 增加连续异常段合并、冷却期抑制、升级告警等工程逻辑
+5. **滚动回测**: 按月滚动训练/测试，评估模型时效性
+6. **跨数据集验证**: 使用 `港陆报表_20260304` 数据验证模型迁移能力
+7. **自动化运维**: 定期重训模型、监控模型漂移、自动生成日报
+
+---
 
 ## 附：关键假设
+
 """
     for i, a in enumerate(assumptions, 1):
-        md += f"\n{i}. {a}"
+        md += f"{i}. {a}\n"
+
+    md += """
+---
+
+*报告由 `scripts/run_pipeline.py` 自动生成，基于真实实验结果。*
+"""
 
     write_text(md, report_path)

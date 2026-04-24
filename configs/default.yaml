@@ -5,7 +5,7 @@ data:
   data_root: data/数据报表_20260405
   mapping_file: data/数据报表_20260405/点位及治理工艺.xlsx
   file_glob: "**/*.xls"
-  max_files: 8
+  max_files: null
   parse_batch_size: 20
   parse_cache_dir: outputs/cache/parsed
 
@@ -21,6 +21,7 @@ labeling:
 features:
   windows: [5, 10, 30, 60]
   max_base_numeric_features: 20
+  threshold_count_windows: [10, 30, 60]
 
 split:
   train_ratio: 0.7
@@ -28,7 +29,7 @@ split:
   test_ratio: 0.15
 
 models:
-  enabled: ["logreg", "random_forest", "hist_gbm"]
+  enabled: ["logreg", "random_forest", "lightgbm", "hist_gbm"]
   threshold_min_precision: 0.30
-  max_train_rows: 30000
-  max_val_rows: 10000
+  max_train_rows: 80000
+  max_val_rows: 20000

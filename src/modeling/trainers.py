@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Dict, List, Tuple
 
 import numpy as np
@@ -18,6 +18,7 @@ class TrainArtifacts:
     model_name: str
     pipeline: Pipeline
     feature_names: List[str]
+    feature_importances: Dict[str, float] = field(default_factory=dict)
 
 
 def _build_preprocessor(numeric_cols: List[str], categorical_cols: List[str]) -> ColumnTransformer:
@@ -48,18 +49,38 @@ def _get_model(name: str, random_state: int):
         return LogisticRegression(max_iter=500, class_weight="balanced", random_state=random_state)
     if name == "random_forest":
         return RandomForestClassifier(
-            n_estimators=120,
+            n_estimators=200,
             min_samples_leaf=5,
             class_weight="balanced_subsample",
             random_state=random_state,
             n_jobs=-1,
         )
     if name == "hist_gbm":
-        return HistGradientBoostingClassifier(max_depth=8, random_state=random_state)
+        return HistGradientBoostingClassifier(
+            max_depth=8,
+            learning_rate=0.05,
+            max_iter=300,
+            random_state=random_state,
+        )
+    if name == "lightgbm":
+        try:
+            from lightgbm import LGBMClassifier
+            return LGBMClassifier(
+                n_estimators=300,
+                max_depth=8,
+                learning_rate=0.05,
+                subsample=0.9,
+                colsample_bytree=0.9,
+                is_unbalance=True,
+                random_state=random_state,
+                verbose=-1,
+                n_jobs=-1,
+            )
+        except ImportError:
+            return None
     if name == "xgboost":
         try:
             from xgboost import XGBClassifier
-
             return XGBClassifier(
                 n_estimators=300,
                 max_depth=6,
@@ -69,9 +90,35 @@ def _get_model(name: str, random_state: int):
                 eval_metric="logloss",
                 random_state=random_state,
             )
-        except Exception:
+        except ImportError:
             return None
     return None
+
+
+def _extract_feature_importance(pipe: Pipeline, feature_cols: List[str], numeric_cols: List[str], categorical_cols: List[str]) -> Dict[str, float]:
+    model = pipe.named_steps["model"]
+    pre = pipe.named_steps["pre"]
+
+    try:
+        cat_features = []
+        if categorical_cols:
+            ohe = pre.named_transformers_["cat"].named_steps["onehot"]
+            cat_features = list(ohe.get_feature_names_out(categorical_cols))
+        all_names = numeric_cols + cat_features
+    except Exception:
+        all_names = feature_cols
+
+    importances = {}
+    if hasattr(model, "feature_importances_"):
+        imp = model.feature_importances_
+        for name, val in zip(all_names[:len(imp)], imp):
+            importances[name] = float(val)
+    elif hasattr(model, "coef_"):
+        coef = model.coef_.flatten()
+        for name, val in zip(all_names[:len(coef)], coef):
+            importances[name] = float(abs(val))
+
+    return importances
 
 
 def train_model(
@@ -98,8 +145,19 @@ def train_model(
     pipe.fit(X_train, y_train)
     val_score = pipe.predict_proba(X_val)[:, 1]
 
-    feature_names = feature_cols
-    return TrainArtifacts(model_name=model_name, pipeline=pipe, feature_names=feature_names), y_val.to_numpy(), val_score, "ok"
+    importances = _extract_feature_importance(pipe, feature_cols, numeric_cols, categorical_cols)
+
+    return (
+        TrainArtifacts(
+            model_name=model_name,
+            pipeline=pipe,
+            feature_names=feature_cols,
+            feature_importances=importances,
+        ),
+        y_val.to_numpy(),
+        val_score,
+        "ok",
+    )
 
 
 def predict_scores(artifacts: TrainArtifacts, df: pd.DataFrame, feature_cols: List[str]) -> np.ndarray:
